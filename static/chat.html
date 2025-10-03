@@ -1606,7 +1606,7 @@ async function updateContextIndicatorDynamic(baseTokenCount, streamingContent) {
         const detailsEl = document.getElementById('contextDetails');
         
         indicator.style.display = 'block';
-        fill.style.width = `${percentage}%`;
+        fill.style.width = `${currentTokens / maxTokens}%`;
         
         // Animate percentage
         const startPercentage = previousTokenData.percentage;
