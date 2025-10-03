@@ -1903,41 +1903,46 @@ async function updateContextIndicatorDynamic(baseTokenCount, streamingContent) {
 // Update the regular context indicator function
 async function updateContextIndicator() {
     if (!currentChatId) return;
-    
+
     try {
         const response = await fetch(`/api/chats/${currentChatId}/tokens`);
         const data = await response.json();
-        
-        window.cachedMaxContext = data.total;
-        
-        const percentage = Math.min(Math.round((data.used / data.total) * 100),100);
-        
+
+        // Cache the model's max context for previews / streaming updates
+        window.cachedMaxContext = data.total || 0;
+
+        const used = data.used || 0;
+        const total = data.total || 0;
+        const percentage = total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
+
         const indicator = document.getElementById('contextIndicator');
         const fill = document.getElementById('contextFill');
         const percentageEl = document.getElementById('contextPercentage');
         const detailsEl = document.getElementById('contextDetails');
-        
+
         indicator.style.display = 'block';
-        fill.style.width = `${(currentTokens / maxTokens) * 100}%`;
-        
+
+        // ✅ Use the actual values we just fetched
+        fill.style.width = `${percentage}%`;
+
         // Animate from previous values
         animatePercentage(percentageEl, previousTokenData.percentage || 0, percentage, 300);
-        animateTokenCounts(detailsEl, previousTokenData.used || 0, data.used, data.total, 300);
-        
+        animateTokenCounts(detailsEl, previousTokenData.used || 0, used, total, 300);
+
         // Update stored values
         previousTokenData = {
-            used: data.used,
-            total: data.total,
-            percentage: percentage
+            used,
+            total,
+            percentage
         };
-        
+
         // Update color smoothly
         updateContextBarColor(fill, percentage);
-        
     } catch (error) {
         console.error('Error updating context indicator:', error);
     }
 }
+
 
 // Specialized function for animating percentage
 function animatePercentage(element, start, end, duration = 300) {
