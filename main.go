@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -30,8 +31,9 @@ type Config struct {
 		Password string `yaml:"password"`
 	} `yaml:"auth"`
 	Ollama struct {
-		URL   string `yaml:"url"`
-		Model string `yaml:"model"`
+		URL       string `yaml:"url"`
+		Model     string `yaml:"model"`
+		MaxNumCtx int    `yaml:"max_num_ctx,omitempty"`
 	} `yaml:"ollama"`
 	Database struct {
 		Path string `yaml:"path"`
@@ -65,9 +67,10 @@ type OllamaMessage struct {
 }
 
 type OllamaRequest struct {
-	Model    string          `json:"model"`
-	Messages []OllamaMessage `json:"messages"`
-	Stream   bool            `json:"stream"`
+	Model    string                 `json:"model"`
+	Messages []OllamaMessage        `json:"messages"`
+	Stream   bool                   `json:"stream"`
+	Options  map[string]interface{} `json:"options,omitempty"`
 }
 
 type OllamaResponse struct {
@@ -318,8 +321,15 @@ func apiMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		messages = []Message{}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(messages)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+
+	// Ensure clean JSON encoding
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(messages); err != nil {
+		log.Printf("Error encoding messages: %v", err)
+	}
 }
 
 func apiChatHandler(w http.ResponseWriter, r *http.Request) {
@@ -335,16 +345,16 @@ func apiChatHandler(w http.ResponseWriter, r *http.Request) {
 	// Auto-name chat if it's still "New Chat" and this is the first message
 	var messageCount int
 	db.QueryRow("SELECT COUNT(*) FROM messages WHERE chat_id = ?", chatID).Scan(&messageCount)
+
 	shouldGenerateTitle := false
+	log.Printf("Message count for chat %s: %d", chatID, messageCount)
 	if messageCount == 0 {
-		var currentTitle string
-		db.QueryRow("SELECT title FROM chats WHERE id = ?", chatID).Scan(&currentTitle)
-		if currentTitle == "New Chat" {
-			shouldGenerateTitle = true
-		}
+		shouldGenerateTitle = true
 	}
 
-	// Save user message
+	log.Printf("shouldGenerateTitle: %v", shouldGenerateTitle)
+
+	// Save user message ONCE HERE
 	saveMessage(chatID, "user", req.Message)
 	updateChatTimestamp(chatID)
 
@@ -380,18 +390,24 @@ func apiChatHandler(w http.ResponseWriter, r *http.Request) {
 		history = []OllamaMessage{}
 	}
 
-	// Add current message with images if present
-	currentMsg := OllamaMessage{
-		Role:    "user",
-		Content: req.Message,
-		Images:  req.Files,
+	// If there are images, add them to the last user message
+	if len(req.Files) > 0 && len(history) > 0 {
+		history[len(history)-1].Images = req.Files
 	}
-	history = append(history, currentMsg)
+
+	// Get model's max context
+	maxContext := getModelMaxContext(config.Ollama.Model)
+
+	// Calculate optimal context size for this request
+	optimalContext := calculateNeededContext(history, maxContext)
 
 	ollamaReq := OllamaRequest{
 		Model:    config.Ollama.Model,
 		Messages: history,
 		Stream:   true,
+		Options: map[string]interface{}{
+			"num_ctx": optimalContext,
+		},
 	}
 
 	reqBody, _ := json.Marshal(ollamaReq)
@@ -441,6 +457,8 @@ func apiChatHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	log.Printf("Full response: %s", fullResponse)
+
 	if fullResponse != "" {
 		saveMessage(chatID, "assistant", fullResponse)
 
@@ -450,14 +468,30 @@ func apiChatHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
+
 func generateTitleWithLLM(chatID, userMessage, assistantResponse string) {
-	// Create a prompt for title generation
-	titlePrompt := fmt.Sprintf(`Based on this conversation, generate a short, concise title (maximum 6 words). Only respond with the title, nothing else.
+	log.Printf("[TITLE] Starting title generation for chat %s", chatID)
 
-User: %s
-Assistant: %s
+	// Truncate long user messages to keep title generation fast
+	truncatedMessage := userMessage
+	const maxTitlePromptLength = 200 // characters
 
-Title:`, userMessage, assistantResponse)
+	if len(userMessage) > maxTitlePromptLength {
+		// Try to truncate at a word boundary
+		truncatedMessage = userMessage[:maxTitlePromptLength]
+		lastSpace := strings.LastIndex(truncatedMessage, " ")
+		if lastSpace > 100 { // Only use word boundary if it's reasonable
+			truncatedMessage = truncatedMessage[:lastSpace]
+		}
+		truncatedMessage += "..."
+	}
+
+	log.Printf("[TITLE] Truncated message: %s", truncatedMessage)
+
+	// Create a simpler, more direct prompt using only the user message
+	titlePrompt := fmt.Sprintf(`Generate a 3-5 word title for this message. Respond with ONLY the title, no quotes or punctuation:
+
+%s`, truncatedMessage)
 
 	ollamaReq := OllamaRequest{
 		Model: config.Ollama.Model,
@@ -468,57 +502,87 @@ Title:`, userMessage, assistantResponse)
 			},
 		},
 		Stream: false,
+		Options: map[string]interface{}{
+			"temperature": 0.3, // Lower temperature for faster, more focused responses
+			"num_predict": 20,  // Limit tokens to prevent long responses
+		},
 	}
 
 	reqBody, err := json.Marshal(ollamaReq)
 	if err != nil {
-		log.Printf("Error marshaling title request: %v", err)
+		log.Printf("[TITLE ERROR] Error marshaling title request: %v", err)
 		return
 	}
 
+	log.Printf("[TITLE] Sending request to Ollama...")
 	resp, err := http.Post(config.Ollama.URL+"/api/chat", "application/json", bytes.NewBuffer(reqBody))
 	if err != nil {
-		log.Printf("Error generating title: %v", err)
+		log.Printf("[TITLE ERROR] Error generating title: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	var ollamaResp OllamaResponse
 	if err := json.NewDecoder(resp.Body).Decode(&ollamaResp); err != nil {
-		log.Printf("Error decoding title response: %v", err)
+		log.Printf("[TITLE ERROR] Error decoding title response: %v", err)
 		return
 	}
 
+	log.Printf("[TITLE] Raw response from LLM: '%s'", ollamaResp.Message.Content)
+
 	title := strings.TrimSpace(ollamaResp.Message.Content)
 
-	// Clean up the title
-	title = strings.Trim(title, `"'`)
-	if len(title) > 60 {
-		title = title[:60] + "..."
+	// More aggressive cleanup
+	title = strings.Trim(title, `"':.!?`)
+
+	// Remove common prefix patterns that models sometimes add
+	title = strings.TrimPrefix(title, "Title: ")
+	title = strings.TrimPrefix(title, "title: ")
+
+	// Limit to 40 characters
+	if len(title) > 40 {
+		title = title[:40] + "..."
 	}
 
 	if title == "" {
-		title = generateTitle(userMessage) // Fallback to old method
+		log.Printf("[TITLE] Title was empty, using fallback")
+		// Fallback: just use first few words of user message
+		words := strings.Fields(userMessage)
+		if len(words) > 5 {
+			title = strings.Join(words[:5], " ") + "..."
+		} else {
+			title = strings.Join(words, " ")
+		}
 	}
+
+	log.Printf("[TITLE] Final title: '%s'", title)
 
 	// Update the chat title
 	_, err = db.Exec("UPDATE chats SET title = ? WHERE id = ?", title, chatID)
 	if err != nil {
-		log.Printf("Error updating chat title: %v", err)
+		log.Printf("[TITLE ERROR] Error updating chat title: %v", err)
 		return
 	}
 
+	log.Printf("[TITLE] Database updated successfully")
+
 	// Broadcast the title update to all listening clients
 	titleUpdatesMutex.Lock()
+	channelCount := len(titleUpdateChannels[chatID])
+	log.Printf("[TITLE] Broadcasting to %d channels for chat %s", channelCount, chatID)
 	if channels, exists := titleUpdateChannels[chatID]; exists {
-		for _, ch := range channels {
+		for i, ch := range channels {
 			select {
 			case ch <- title:
+				log.Printf("[TITLE] Sent title to channel %d", i)
 			default:
+				log.Printf("[TITLE] Channel %d full, skipping", i)
 			}
 		}
 	}
 	titleUpdatesMutex.Unlock()
+
+	log.Printf("[TITLE] Title generation complete for chat %s", chatID)
 }
 
 func apiChatTitleStreamHandler(w http.ResponseWriter, r *http.Request) {
@@ -701,30 +765,58 @@ func apiTokenUsageHandler(w http.ResponseWriter, r *http.Request) {
 		totalTokens += estimateTokens(content)
 	}
 
-	// Get num_ctx
-	resp, _ := http.Post(config.Ollama.URL+"/api/show", "application/json",
-		strings.NewReader(fmt.Sprintf(`{"name":"%s"}`, config.Ollama.Model)))
+	// Get model's actual max context
+	maxContext := getModelMaxContext(config.Ollama.Model)
 
-	numCtx := 2048 // default
-	if resp != nil {
-		defer resp.Body.Close()
-		var result struct {
-			Parameters string `json:"parameters"`
-		}
-		if json.NewDecoder(resp.Body).Decode(&result) == nil {
-			lines := strings.Split(result.Parameters, "\n")
-			for _, line := range lines {
-				if strings.Contains(line, "num_ctx") {
-					fmt.Sscanf(line, "num_ctx %d", &numCtx)
-					break
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(TokenUsage{
+		Used:  totalTokens,
+		Total: maxContext,
+	})
+}
+func getModelMaxContext(modelName string) int {
+	// Check if there's a config override first
+	if config.Ollama.MaxNumCtx > 0 {
+		log.Printf("[INFO] Using configured max_num_ctx: %d", config.Ollama.MaxNumCtx)
+		return config.Ollama.MaxNumCtx
+	}
+
+	reqBody := fmt.Sprintf(`{"name":"%s"}`, modelName)
+	resp, err := http.Post(config.Ollama.URL+"/api/show", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		log.Printf("[ERROR] Error getting model info: %v", err)
+		return 8192
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[ERROR] Error reading response body: %v", err)
+		return 8192
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		log.Printf("[ERROR] Error decoding model info: %v", err)
+		return 8192
+	}
+
+	// Try model_info for context_length
+	if modelInfo, ok := result["model_info"].(map[string]interface{}); ok {
+		for key, value := range modelInfo {
+			if strings.HasSuffix(key, ".context_length") {
+				if ctxLen, ok := value.(float64); ok && ctxLen > 0 {
+					log.Printf("[INFO] Found model max context_length: %d", int(ctxLen))
+					return int(ctxLen)
 				}
 			}
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(TokenUsage{
-		Used:  totalTokens,
-		Total: numCtx,
-	})
+	log.Printf("[WARN] No context size found, using default: 8192")
+	return 8192
+}
+
+func calculateNeededContext(messages []OllamaMessage, maxContext int) int {
+	return maxContext
 }

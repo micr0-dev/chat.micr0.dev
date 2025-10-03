@@ -9,6 +9,7 @@ auth:
 ollama:
   url: "http://localhost:11434"
   model: "gemma3:12b"
+  max_num_ctx: 16000
 
 database:
   path: "chat_history.db"
