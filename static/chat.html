@@ -1918,7 +1918,7 @@ async function updateContextIndicator() {
         const detailsEl = document.getElementById('contextDetails');
         
         indicator.style.display = 'block';
-        fill.style.width = `${percentage}%`;
+        fill.style.width = `${(currentTokens / maxTokens) * 100}%`;
         
         // Animate from previous values
         animatePercentage(percentageEl, previousTokenData.percentage || 0, percentage, 300);

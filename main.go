@@ -740,31 +740,72 @@ func apiTokenUsageHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	chatID := vars["id"]
 
-	rows, err := db.Query("SELECT role, content FROM messages WHERE chat_id = ? ORDER BY timestamp ASC", chatID)
+	// 1) Load full conversation history (system/user/assistant)
+	history, err := getConversationHistory(chatID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "failed to load conversation history: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
 
-	totalTokens := 0
-	for rows.Next() {
-		var role, content string
-		if err := rows.Scan(&role, &content); err != nil {
-			continue
-		}
-		totalTokens += estimateTokens(content)
+	// If there are no messages yet, usage is zero
+	if len(history) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenUsage{Used: 0, Total: getModelMaxContext(config.Ollama.Model)})
+		return
 	}
 
-	// Get model's actual max context
-	maxContext := getModelMaxContext(config.Ollama.Model)
+	// 2) Ask Ollama to evaluate the prompt ONLY (no generation) to get an exact token count
+	type chatResp struct {
+		Done            bool `json:"done"`
+		PromptEvalCount int  `json:"prompt_eval_count"`
+		PromptEvalDur   int  `json:"prompt_eval_duration"`
+		EvalCount       int  `json:"eval_count"`
+		EvalDuration    int  `json:"eval_duration"`
+		TotalDuration   int  `json:"total_duration"`
+		LoadDuration    int  `json:"load_duration"`
+	}
+
+	payload := OllamaRequest{
+		Model:    config.Ollama.Model,
+		Messages: history,
+		Stream:   false, // single JSON response
+		Options: map[string]interface{}{
+			"num_predict": 0, // evaluate prompt only
+		},
+	}
+
+	reqBody, err := json.Marshal(payload)
+	if err != nil {
+		http.Error(w, "failed to marshal request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp, err := http.Post(config.Ollama.URL+"/api/chat", "application/json", bytes.NewBuffer(reqBody))
+	if err != nil {
+		http.Error(w, "failed to contact model: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	var stats chatResp
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		http.Error(w, "failed to decode model response: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// 3) Used = tokens in the prompt that would be sent RIGHT NOW
+	used := stats.PromptEvalCount
+
+	// 4) Total = model's max context
+	total := getModelMaxContext(config.Ollama.Model)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(TokenUsage{
-		Used:  totalTokens,
-		Total: maxContext,
+		Used:  used,
+		Total: total,
 	})
 }
+
 func getModelMaxContext(modelName string) int {
 	// Check if there's a config override first
 	if config.Ollama.MaxNumCtx > 0 {
