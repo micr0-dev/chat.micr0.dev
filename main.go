@@ -347,12 +347,9 @@ func apiChatHandler(w http.ResponseWriter, r *http.Request) {
 	db.QueryRow("SELECT COUNT(*) FROM messages WHERE chat_id = ?", chatID).Scan(&messageCount)
 
 	shouldGenerateTitle := false
-	log.Printf("Message count for chat %s: %d", chatID, messageCount)
 	if messageCount == 0 {
 		shouldGenerateTitle = true
 	}
-
-	log.Printf("shouldGenerateTitle: %v", shouldGenerateTitle)
 
 	// Save user message ONCE HERE
 	saveMessage(chatID, "user", req.Message)
@@ -448,8 +445,6 @@ func apiChatHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	log.Printf("Full response: %s", fullResponse)
-
 	if fullResponse != "" {
 		saveMessage(chatID, "assistant", fullResponse)
 
@@ -461,8 +456,6 @@ func apiChatHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func generateTitleWithLLM(chatID, userMessage, assistantResponse string) {
-	log.Printf("[TITLE] Starting title generation for chat %s", chatID)
-
 	// Truncate long user messages to keep title generation fast
 	truncatedMessage := userMessage
 	const maxTitlePromptLength = 200 // characters
@@ -476,9 +469,6 @@ func generateTitleWithLLM(chatID, userMessage, assistantResponse string) {
 		}
 		truncatedMessage += "..."
 	}
-
-	log.Printf("[TITLE] Truncated message: %s", truncatedMessage)
-
 	// Create a simpler, more direct prompt using only the user message
 	titlePrompt := fmt.Sprintf(`Generate a 3-5 word title for this message. Respond with ONLY the title, no quotes or punctuation:
 
@@ -505,7 +495,6 @@ func generateTitleWithLLM(chatID, userMessage, assistantResponse string) {
 		return
 	}
 
-	log.Printf("[TITLE] Sending request to Ollama...")
 	resp, err := http.Post(config.Ollama.URL+"/api/chat", "application/json", bytes.NewBuffer(reqBody))
 	if err != nil {
 		log.Printf("[TITLE ERROR] Error generating title: %v", err)
@@ -518,8 +507,6 @@ func generateTitleWithLLM(chatID, userMessage, assistantResponse string) {
 		log.Printf("[TITLE ERROR] Error decoding title response: %v", err)
 		return
 	}
-
-	log.Printf("[TITLE] Raw response from LLM: '%s'", ollamaResp.Message.Content)
 
 	title := strings.TrimSpace(ollamaResp.Message.Content)
 
@@ -536,7 +523,6 @@ func generateTitleWithLLM(chatID, userMessage, assistantResponse string) {
 	}
 
 	if title == "" {
-		log.Printf("[TITLE] Title was empty, using fallback")
 		// Fallback: just use first few words of user message
 		words := strings.Fields(userMessage)
 		if len(words) > 5 {
@@ -546,8 +532,6 @@ func generateTitleWithLLM(chatID, userMessage, assistantResponse string) {
 		}
 	}
 
-	log.Printf("[TITLE] Final title: '%s'", title)
-
 	// Update the chat title
 	_, err = db.Exec("UPDATE chats SET title = ? WHERE id = ?", title, chatID)
 	if err != nil {
@@ -555,12 +539,8 @@ func generateTitleWithLLM(chatID, userMessage, assistantResponse string) {
 		return
 	}
 
-	log.Printf("[TITLE] Database updated successfully")
-
 	// Broadcast the title update to all listening clients
 	titleUpdatesMutex.Lock()
-	channelCount := len(titleUpdateChannels[chatID])
-	log.Printf("[TITLE] Broadcasting to %d channels for chat %s", channelCount, chatID)
 	if channels, exists := titleUpdateChannels[chatID]; exists {
 		for i, ch := range channels {
 			select {
@@ -572,8 +552,6 @@ func generateTitleWithLLM(chatID, userMessage, assistantResponse string) {
 		}
 	}
 	titleUpdatesMutex.Unlock()
-
-	log.Printf("[TITLE] Title generation complete for chat %s", chatID)
 }
 
 func apiChatTitleStreamHandler(w http.ResponseWriter, r *http.Request) {
@@ -809,7 +787,6 @@ func apiTokenUsageHandler(w http.ResponseWriter, r *http.Request) {
 func getModelMaxContext(modelName string) int {
 	// Check if there's a config override first
 	if config.Ollama.MaxNumCtx > 0 {
-		log.Printf("[INFO] Using configured max_num_ctx: %d", config.Ollama.MaxNumCtx)
 		return config.Ollama.MaxNumCtx
 	}
 
@@ -838,7 +815,6 @@ func getModelMaxContext(modelName string) int {
 		for key, value := range modelInfo {
 			if strings.HasSuffix(key, ".context_length") {
 				if ctxLen, ok := value.(float64); ok && ctxLen > 0 {
-					log.Printf("[INFO] Found model max context_length: %d", int(ctxLen))
 					return int(ctxLen)
 				}
 			}
