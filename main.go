@@ -395,19 +395,10 @@ func apiChatHandler(w http.ResponseWriter, r *http.Request) {
 		history[len(history)-1].Images = req.Files
 	}
 
-	// Get model's max context
-	maxContext := getModelMaxContext(config.Ollama.Model)
-
-	// Calculate optimal context size for this request
-	optimalContext := calculateNeededContext(history, maxContext)
-
 	ollamaReq := OllamaRequest{
 		Model:    config.Ollama.Model,
 		Messages: history,
 		Stream:   true,
-		Options: map[string]interface{}{
-			"num_ctx": optimalContext,
-		},
 	}
 
 	reqBody, _ := json.Marshal(ollamaReq)
@@ -815,8 +806,4 @@ func getModelMaxContext(modelName string) int {
 
 	log.Printf("[WARN] No context size found, using default: 8192")
 	return 8192
-}
-
-func calculateNeededContext(messages []OllamaMessage, maxContext int) int {
-	return maxContext
 }
