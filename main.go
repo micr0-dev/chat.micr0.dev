@@ -154,7 +154,16 @@ func initDB() {
 		content TEXT NOT NULL,
 		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
-	);`
+	);
+	
+	CREATE TABLE IF NOT EXISTS token_usage_cache (
+    chat_id INTEGER PRIMARY KEY,
+    used INTEGER NOT NULL,
+    total INTEGER NOT NULL,
+    valid INTEGER NOT NULL DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
+);`
 
 	if _, err := db.Exec(createTables); err != nil {
 		log.Fatal("Error creating tables:", err)
@@ -340,6 +349,10 @@ func apiChatHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	if err := invalidateTokenCache(chatID); err != nil {
+		log.Printf("[TOKENS] failed to invalidate cache for chat %s: %v", chatID, err)
 	}
 
 	// Auto-name chat if it's still "New Chat" and this is the first message
@@ -718,6 +731,15 @@ func apiTokenUsageHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	chatID := vars["id"]
 
+	// 0) Try cache first
+	if cached, valid, err := getCachedTokenUsage(chatID); err == nil && valid {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cached)
+		return
+	} else if err != nil {
+		log.Printf("[TOKENS] cache read error for chat %s: %v", chatID, err)
+	}
+
 	// 1) Load full conversation history (system/user/assistant)
 	history, err := getConversationHistory(chatID)
 	if err != nil {
@@ -725,14 +747,18 @@ func apiTokenUsageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If there are no messages yet, usage is zero
+	total := getModelMaxContext(config.Ollama.Model)
+
+	// If there are no messages yet, usage is zero (cache it as valid)
 	if len(history) == 0 {
+		tu := TokenUsage{Used: 0, Total: total}
+		_ = setCachedTokenUsage(chatID, tu.Used, tu.Total)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(TokenUsage{Used: 0, Total: getModelMaxContext(config.Ollama.Model)})
+		_ = json.NewEncoder(w).Encode(tu)
 		return
 	}
 
-	// 2) Ask Ollama to evaluate the prompt ONLY (no generation) to get an exact token count
+	// 2) Ask Ollama to evaluate the prompt ONLY (no generation) to get exact token count
 	type chatResp struct {
 		Done            bool `json:"done"`
 		PromptEvalCount int  `json:"prompt_eval_count"`
@@ -746,7 +772,7 @@ func apiTokenUsageHandler(w http.ResponseWriter, r *http.Request) {
 	payload := OllamaRequest{
 		Model:    config.Ollama.Model,
 		Messages: history,
-		Stream:   false, // single JSON response
+		Stream:   false,
 		Options: map[string]interface{}{
 			"num_predict": 0, // evaluate prompt only
 		},
@@ -771,17 +797,16 @@ func apiTokenUsageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3) Used = tokens in the prompt that would be sent RIGHT NOW
 	used := stats.PromptEvalCount
+	tu := TokenUsage{Used: used, Total: total}
 
-	// 4) Total = model's max context
-	total := getModelMaxContext(config.Ollama.Model)
+	// 3) Cache as valid
+	if err := setCachedTokenUsage(chatID, tu.Used, tu.Total); err != nil {
+		log.Printf("[TOKENS] cache write error for chat %s: %v", chatID, err)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(TokenUsage{
-		Used:  used,
-		Total: total,
-	})
+	_ = json.NewEncoder(w).Encode(tu)
 }
 
 func getModelMaxContext(modelName string) int {
@@ -823,4 +848,46 @@ func getModelMaxContext(modelName string) int {
 
 	log.Printf("[WARN] No context size found, using default: 8192")
 	return 8192
+}
+
+func getCachedTokenUsage(chatID string) (TokenUsage, bool, error) {
+	var tu TokenUsage
+	var valid int
+	err := db.QueryRow(`
+		SELECT used, total, valid
+		FROM token_usage_cache
+		WHERE chat_id = ?`, chatID).Scan(&tu.Used, &tu.Total, &valid)
+	if err == sql.ErrNoRows {
+		return TokenUsage{}, false, nil
+	}
+	if err != nil {
+		return TokenUsage{}, false, err
+	}
+	return tu, valid == 1, nil
+}
+
+func setCachedTokenUsage(chatID string, used, total int) error {
+	_, err := db.Exec(`
+		INSERT INTO token_usage_cache (chat_id, used, total, valid, updated_at)
+		VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
+		ON CONFLICT(chat_id) DO UPDATE SET
+			used = excluded.used,
+			total = excluded.total,
+			valid = 1,
+			updated_at = CURRENT_TIMESTAMP
+	`, chatID, used, total)
+	return err
+}
+
+func invalidateTokenCache(chatID string) error {
+	_, err := db.Exec(`
+		INSERT INTO token_usage_cache (chat_id, used, total, valid, updated_at)
+		VALUES (?, COALESCE((SELECT used FROM token_usage_cache WHERE chat_id = ?), 0),
+		          COALESCE((SELECT total FROM token_usage_cache WHERE chat_id = ?), 0),
+		          0, CURRENT_TIMESTAMP)
+		ON CONFLICT(chat_id) DO UPDATE SET
+			valid = 0,
+			updated_at = CURRENT_TIMESTAMP
+	`, chatID, chatID, chatID)
+	return err
 }
