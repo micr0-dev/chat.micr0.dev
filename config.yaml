@@ -1,0 +1,14 @@
+server:
+  port: 8080
+  session_secret: "change-this-secret-key"
+
+auth:
+  username: "admin"
+  password: "pa122ssw1232ord123"
+
+ollama:
+  url: "http://localhost:11434"
+  model: "gemma3:12b"
+
+database:
+  path: "chat_history.db"
